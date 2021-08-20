@@ -249,29 +249,23 @@ OIIO_EXPORT const char* raw_input_extensions[]
 OIIO_PLUGIN_EXPORTS_END
 
 namespace {
-const char*
-libraw_filter_to_str(unsigned int filters)
-{
-    // Convert the libraw filter pattern description
-    // into a slightly more human readable string
-    // LibRaw/internal/defines.h:166
-    switch (filters) {
-    // CYGM
-    case 0xe1e4e1e4: return "GMYC";
-    case 0x1b4e4b1e: return "CYGM";
-    case 0x1e4b4e1b: return "YCGM";
-    case 0xb4b4b4b4: return "GMCY";
-    case 0x1e4e1e4e: return "CYMG";
-
-    // RGB
-    case 0x16161616: return "BGRG";
-    case 0x61616161: return "GRGB";
-    case 0x49494949: return "GBGR";
-    case 0x94949494: return "RGBG";
-    default: break;
+    std::string
+    libraw_filter_to_str(std::unique_ptr<LibRaw>& libraw)
+    {
+        //hopefully a 4 char string is enough to identify
+        std::string filter(4,'\0');
+        auto& cdesc = libraw->imgdata.idata.cdesc;
+        filter[0] = cdesc[libraw->COLOR(0,0)];
+        filter[1] = cdesc[libraw->COLOR(1,0)];
+        filter[2] = cdesc[libraw->COLOR(0,1)];
+        filter[3] = cdesc[libraw->COLOR(1,1)];
+        return filter;
     }
-    return "";
-}
+
+    bool is_rgbg_or_bgrg(std::unique_ptr<LibRaw>& libraw){
+        std::string filter = libraw_filter_to_str(libraw);
+        return filter == "RGBG" || filter == "BGRG";
+    };
 }  // namespace
 
 bool
@@ -487,14 +481,10 @@ RawInput::open_raw(bool unpack, const std::string& name,
         auto& params = m_processor->imgdata.params;
         auto& idata  = m_processor->imgdata.idata;
 
-        auto is_rgbg_or_bgrg = [&](unsigned int filters) {
-            std::string filter(libraw_filter_to_str(filters));
-            return filter == "RGBG" || filter == "BGRG";
-        };
         float norm[4] = { color.cam_mul[0], color.cam_mul[1], color.cam_mul[2],
                           color.cam_mul[3] };
 
-        if (is_rgbg_or_bgrg(idata.filters)) {
+        if (is_rgbg_or_bgrg(m_processor)) {
             // normalize white balance around green
             norm[0] /= norm[1];
             norm[1] /= norm[1];
@@ -645,6 +635,17 @@ RawInput::open_raw(bool unpack, const std::string& name,
         if (demosaic_algs[d])
             m_processor->imgdata.params.user_qual = d;
         else if (Strutil::iequals(demosaic, "none")) {
+#ifdef LIBRAW_DECODER_FLATFIELD
+            // See if we can access the Bayer patterned data for this raw file
+            libraw_decoder_info_t decoder_info;
+            m_processor->get_decoder_info(&decoder_info);
+            if (!(decoder_info.decoder_flags & LIBRAW_DECODER_FLATFIELD)) {
+                errorf("Unable to extract unbayered data from file \"%s\"",
+                       name);
+                return false;
+            }
+
+#endif
             // User has selected no demosaicing, so no processing needs to be done
             m_process = false;
 
@@ -653,13 +654,70 @@ RawInput::open_raw(bool unpack, const std::string& name,
             m_spec.channelnames.clear();
             m_spec.channelnames.emplace_back("Y");
 
-            // Put the details about the filter pattern into the metadata
-            std::string filter(
-                libraw_filter_to_str(m_processor->imgdata.idata.filters));
-            if (filter.empty()) {
-                filter = "unknown";
+            // We put the complete raw sensor into the width and height
+            // attributes, and put the visible pixels into the display window
+            // LibRaw will not rotate the images for us, so we must handle that ourselves
+            auto w = m_processor->imgdata.sizes.raw_width;
+            auto h = m_processor->imgdata.sizes.raw_height;
+            auto fw = m_processor->imgdata.sizes.width;
+            auto fh = m_processor->imgdata.sizes.height;
+            auto fx = m_processor->imgdata.sizes.left_margin;
+            auto fy = m_processor->imgdata.sizes.top_margin;
+
+            switch(m_processor->imgdata.sizes.flip){
+                case 3: /*180 degrees*/ {
+                    fx = w - fx;
+                    fy = h - fy;
+                    break;
+                }
+                case 5: /*90 degrees CCW*/ {
+                    std::swap(w,h);
+                    std::swap(fw,fh);
+                    std::swap(fx,fy);
+                    fy = h - fh - fy;
+                    break;
+                }
+                case 6: /*90 degrees CW*/ {
+                    std::swap(w,h);
+                    std::swap(fw,fh);
+                    std::swap(fx,fy);
+                    fx = w - fw - fx;
+                    break;
+                }
+                case 0: /* no rotation */
+                default: break;
             }
+
+            m_spec.width = w;
+            m_spec.height = h;
+            m_spec.full_width = fw;
+            m_spec.full_height = fh;
+            m_spec.full_x = fx;
+            m_spec.full_y = fy;
+
+            // Store any matrices that might be useful
+            auto& color = m_processor->imgdata.color;
+            auto& idata = m_processor->imgdata.idata;
+            if (idata.dng_version != 0){
+                // If our input file is a DNG, we have access to XYZ matrices
+                // from 2 illuminants
+                m_spec.attribute("raw:ColorMatrix1", TypeMatrix33, &color.dng_color[0].colormatrix);
+                m_spec.attribute("raw:ColorMatrix2", TypeMatrix33, &color.dng_color[1].colormatrix);
+
+            } else {
+                m_spec.attribute("raw:ColorMatrix1", TypeMatrix33, &color.cam_xyz);
+            }
+
+            // Put the details about the filter pattern into the metadata
+            auto filter = libraw_filter_to_str(m_processor);
             m_spec.attribute("raw:FilterPattern", filter);
+
+            // Store the camera white balance settings
+            float asShotNeutral[3] = {1.0, 1.0, 1.0};
+            for (size_t i=0; i<3; ++i){
+                asShotNeutral[i] = 1024.0f / color.cam_mul[i];
+            }
+            m_spec.attribute("raw:asShotNeutral", TypeColor, &asShotNeutral);
 
             // Also, any previously set demosaicing options are void, so remove them
             m_spec.erase_attribute("oiio:Colorspace");
@@ -1470,22 +1528,17 @@ RawInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     if (!m_process) {
         // The user has selected not to apply any debayering.
 
-        // The raw_image buffer might contain junk pixels that are usually trimmed off
-        // we must index into the raw buffer, taking these into account
         auto& sizes        = m_processor->imgdata.sizes;
-        int offset         = sizes.raw_width * sizes.top_margin;
-        int scanline_start = sizes.raw_width * y + sizes.left_margin;
+        int scanline_start = sizes.raw_width * y;
 
         // The raw_image will not have been rotated, so we must factor that into our
         // array access
         // For none or 180 degree rotation, the scanlines are still contiguous in memory
         if (sizes.flip == 0 /*no rotation*/ || sizes.flip == 3 /*180 degrees*/) {
             if (sizes.flip == 3) {
-                scanline_start = sizes.raw_width * (m_spec.height - y)
-                                 + sizes.left_margin;
+                scanline_start = sizes.raw_width * (m_spec.height - y);
             }
-            unsigned short* scanline = &((m_processor->imgdata.rawdata.raw_image
-                                          + offset)[scanline_start]);
+            unsigned short* scanline = &((m_processor->imgdata.rawdata.raw_image)[scanline_start]);
             convert_pixel_values(TypeDesc::UINT16, scanline, m_spec.format,
                                  data, m_spec.width);
         }
@@ -1493,19 +1546,17 @@ RawInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
         // to the array direction so we must copy the pixels into a temporary contiguous buffer
         else if (sizes.flip == 5 /*90 degrees CCW*/
                  || sizes.flip == 6 /*90 degrees CW*/) {
-            scanline_start = m_spec.height - y + sizes.left_margin;
+            scanline_start = m_spec.height - y;
             if (sizes.flip == 6) {
-                scanline_start = y + sizes.left_margin;
+                scanline_start = y;
             }
             auto buffer = std::make_unique<uint16_t[]>(m_spec.width);
             for (size_t i = 0; i < static_cast<size_t>(m_spec.width); ++i) {
                 size_t index
                     = (sizes.flip == 5)
                           ? i
-                          : m_spec.width
-                                - i;  //flip the index if rotating 90 degrees CW
-                buffer[index] = (m_processor->imgdata.rawdata.raw_image
-                                 + offset)[sizes.raw_width * i + scanline_start];
+                          : m_spec.width - i;  //flip the index if rotating 90 degrees CW
+                buffer[index] = (m_processor->imgdata.rawdata.raw_image)[sizes.raw_width * i + scanline_start];
             }
             convert_pixel_values(TypeDesc::UINT16, buffer.get(), m_spec.format,
                                  data, m_spec.width);

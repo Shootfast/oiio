@@ -287,7 +287,7 @@ PLUGENTRY(png);
 PLUGENTRY(pnm);
 PLUGENTRY_RO(psd);
 PLUGENTRY_RO(ptex);
-PLUGENTRY_RO(raw);
+PLUGENTRY(raw);
 PLUGENTRY(rla);
 PLUGENTRY(sgi);
 PLUGENTRY_RO(softimage);
@@ -400,8 +400,12 @@ catalog_builtin_plugins()
 #if defined(USE_PTEX) && !defined(DISABLE_PTEX)
     DECLAREPLUG_RO (ptex);
 #endif
-#if defined(USE_LIBRAW) && !defined(DISABLE_RAW)
-    DECLAREPLUG_RO (raw);
+#if !defined(DISABLE_RAW)
+#ifdef USE_LIBRAW
+    DECLAREPLUG (raw);
+#else
+    DECLAREPLUG_WO (raw);
+#endif
 #endif
 #if !defined(DISABLE_RLA)
     DECLAREPLUG (rla);
