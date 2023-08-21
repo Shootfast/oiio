@@ -170,6 +170,15 @@ private:
                              TypeDesc(TypeDesc::INT, size), data.data());
         }
     }
+    void add(string_view prefix, std::string name, cspan<unsigned int> data,
+             bool force = true, unsigned int ignval = 0)
+    {
+        if (force || !allval(data, ignval)) {
+            int size = data.size() > 1 ? data.size() : 0;
+            m_spec.attribute(prefixedname(prefix, name),
+                             TypeDesc(TypeDesc::UINT, size), data.data());
+        }
+    }
     void add(string_view prefix, std::string name, cspan<short> data,
              bool force = true, short ignval = 0)
     {
@@ -221,14 +230,6 @@ private:
 // Export version number and create function symbols
 OIIO_PLUGIN_EXPORTS_BEGIN
 
-OIIO_EXPORT int raw_imageio_version = OIIO_PLUGIN_VERSION;
-
-OIIO_EXPORT const char*
-raw_imageio_library_version()
-{
-    return ustring::fmtformat("libraw {}", libraw_version()).c_str();
-}
-
 OIIO_EXPORT ImageInput*
 raw_input_imageio_create()
 {
@@ -266,6 +267,12 @@ namespace {
         std::string filter = libraw_filter_to_str(libraw);
         return filter == "RGBG" || filter == "BGRG";
     };
+
+    void m44_to_m33(float (&m44)[4][4], float (&m33)[3][3]){
+        m33[0][0] = m44[0][0]; m33[0][1] = m44[0][1]; m33[0][2] = m44[0][2];
+        m33[1][0] = m44[1][0]; m33[1][1] = m44[1][1]; m33[1][2] = m44[1][2];
+        m33[2][0] = m44[2][0]; m33[2][1] = m44[2][1]; m33[2][2] = m44[2][2];
+    }
 }  // namespace
 
 bool
@@ -479,7 +486,6 @@ RawInput::open_raw(bool unpack, const std::string& name,
     if (config.get_int_attribute("raw:use_camera_wb", 1) == 1) {
         auto& color  = m_processor->imgdata.color;
         auto& params = m_processor->imgdata.params;
-        auto& idata  = m_processor->imgdata.idata;
 
         float norm[4] = { color.cam_mul[0], color.cam_mul[1], color.cam_mul[2],
                           color.cam_mul[3] };
@@ -695,29 +701,9 @@ RawInput::open_raw(bool unpack, const std::string& name,
             m_spec.full_x = fx;
             m_spec.full_y = fy;
 
-            // Store any matrices that might be useful
-            auto& color = m_processor->imgdata.color;
-            auto& idata = m_processor->imgdata.idata;
-            if (idata.dng_version != 0){
-                // If our input file is a DNG, we have access to XYZ matrices
-                // from 2 illuminants
-                m_spec.attribute("raw:ColorMatrix1", TypeMatrix33, &color.dng_color[0].colormatrix);
-                m_spec.attribute("raw:ColorMatrix2", TypeMatrix33, &color.dng_color[1].colormatrix);
-
-            } else {
-                m_spec.attribute("raw:ColorMatrix1", TypeMatrix33, &color.cam_xyz);
-            }
-
             // Put the details about the filter pattern into the metadata
             auto filter = libraw_filter_to_str(m_processor);
             m_spec.attribute("raw:FilterPattern", filter);
-
-            // Store the camera white balance settings
-            float asShotNeutral[3] = {1.0, 1.0, 1.0};
-            for (size_t i=0; i<3; ++i){
-                asShotNeutral[i] = 1024.0f / color.cam_mul[i];
-            }
-            m_spec.attribute("raw:asShotNeutral", TypeColor, &asShotNeutral);
 
             // Also, any previously set demosaicing options are void, so remove them
             m_spec.erase_attribute("oiio:Colorspace");
@@ -1430,22 +1416,68 @@ RawInput::get_shootinginfo()
 void
 RawInput::get_colorinfo()
 {
+    auto& color = m_processor->imgdata.color;
+    auto& idata = m_processor->imgdata.idata;
+
     add("raw", "pre_mul",
-        cspan<float>(&(m_processor->imgdata.color.pre_mul[0]),
-                     &(m_processor->imgdata.color.pre_mul[4])),
+        cspan<float>(&(color.pre_mul[0]),
+                     &(color.pre_mul[4])),
         false, 0.f);
     add("raw", "cam_mul",
-        cspan<float>(&(m_processor->imgdata.color.cam_mul[0]),
-                     &(m_processor->imgdata.color.cam_mul[4])),
+        cspan<float>(&(color.cam_mul[0]),
+                     &(color.cam_mul[4])),
         false, 0.f);
     add("raw", "rgb_cam",
-        cspan<float>(&(m_processor->imgdata.color.rgb_cam[0][0]),
-                     &(m_processor->imgdata.color.rgb_cam[2][4])),
+        cspan<float>(&(color.rgb_cam[0][0]),
+                     &(color.rgb_cam[2][4])),
         false, 0.f);
     add("raw", "cam_xyz",
-        cspan<float>(&(m_processor->imgdata.color.cam_xyz[0][0]),
-                     &(m_processor->imgdata.color.cam_xyz[3][3])),
+        cspan<float>(&(color.cam_xyz[0][0]),
+                     &(color.cam_xyz[3][3])),
         false, 0.f);
+
+    if (idata.dng_version != 0){
+        // If our input file is a DNG, we have access to additional data
+        m_spec.attribute("raw:ColorMatrix1", TypeMatrix33, &color.dng_color[0].colormatrix);
+        m_spec.attribute("raw:ColorMatrix2", TypeMatrix33, &color.dng_color[1].colormatrix);
+
+        float m33[3][3] = {
+            {1.0, 0.0, 0.0},
+            {0.0, 1.0, 0.0},
+            {0.0, 0.0, 1.0}
+        };
+        m44_to_m33(color.dng_color[0].calibration, m33);
+        m_spec.attribute("raw:CalibrationMatrix1", TypeMatrix33, &m33);
+        m44_to_m33(color.dng_color[1].calibration, m33);
+        m_spec.attribute("raw:CalibrationMatrix2", TypeMatrix33, &m33);
+
+        add("raw", "CalibrationIlluminant1", color.dng_color[0].illuminant);
+        add("raw", "CalibrationIlluminant2", color.dng_color[1].illuminant);
+
+        add("raw", "DNGBlack", color.dng_levels.dng_black, false, 0);
+        add("raw", "DNGWhiteLevel",
+            cspan<unsigned int>(&(color.dng_levels.dng_whitelevel[0]),
+                                &(color.dng_levels.dng_whitelevel[3])),
+            false, 0u);
+        add("raw", "DNGAnalogBalance",
+            cspan<float>(&(color.dng_levels.analogbalance[0]),
+                         &(color.dng_levels.analogbalance[3])),
+            false, 1.f);
+        add("raw", "asShotNeutral",
+            cspan<float>(&(color.dng_levels.asshotneutral[0]),
+                         &(color.dng_levels.asshotneutral[3])),
+            false, 1.f);
+    }
+
+    if (!m_spec.find_attribute("raw:asShotNeutral")){
+        // Store the camera white balance settings in a more useful way
+        float asShotNeutral[3] = {1.0, 1.0, 1.0};
+        float norm = std::min({color.cam_mul[0], color.cam_mul[1], color.cam_mul[2]});
+        for (size_t i=0; i<3; ++i){
+            asShotNeutral[i] = norm / color.cam_mul[i];
+        }
+        m_spec.attribute("raw:asShotNeutral", TypeColor, &asShotNeutral);
+    }
 }
 
 
