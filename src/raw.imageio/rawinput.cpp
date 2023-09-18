@@ -443,6 +443,10 @@ RawInput::open_raw(bool unpack, const std::string& name,
     }
     m_processor->adjust_sizes_info_only();
 
+    // Override max library memory allocation (needed for large images)
+    m_processor->imgdata.rawparams.max_raw_memory_mb
+        = config.get_int_attribute("raw:max_raw_memory_mb", LIBRAW_MAX_ALLOC_MB_DEFAULT);
+
     // Process image at half size if "raw:half_size" is not 0
     m_processor->imgdata.params.half_size
         = config.get_int_attribute("raw:half_size", 0);
