@@ -245,7 +245,7 @@ OIIO_EXPORT const char* raw_input_extensions[]
         "kdc", "mdc", "mos", "mrw", "nef", "orf", "pef",  "pxn",  "raf",
         "raw", "rdc", "sr2", "srf", "x3f", "arw", "3fr",  "cine", "ia",
         "kc2", "mef", "nrw", "qtk", "rw2", "sti", "rwl",  "srw",  "drf",
-        "dsc", "ptx", "cap", "iiq", "rwz", "cr3", nullptr };
+        "dsc", "ptx", "cap", "iiq", "rwz", nullptr };
 
 OIIO_PLUGIN_EXPORTS_END
 
@@ -674,29 +674,52 @@ RawInput::open_raw(bool unpack, const std::string& name,
             auto fx = m_processor->imgdata.sizes.left_margin;
             auto fy = m_processor->imgdata.sizes.top_margin;
 
-            switch(m_processor->imgdata.sizes.flip){
-                case 3: /*180 degrees*/ {
-                    fx = w - fx;
-                    fy = h - fy;
-                    break;
-                }
-                case 5: /*90 degrees CCW*/ {
-                    std::swap(w,h);
-                    std::swap(fw,fh);
-                    std::swap(fx,fy);
-                    fy = h - fh - fy;
-                    break;
-                }
-                case 6: /*90 degrees CW*/ {
-                    std::swap(w,h);
-                    std::swap(fw,fh);
-                    std::swap(fx,fy);
-                    fx = w - fw - fx;
-                    break;
-                }
-                case 0: /* no rotation */
-                default: break;
-            }
+			if (m_processor->is_fuji_rotated()){
+				// The width and height attributes represent the bounding
+				// box to debayer fuji's Super CCD - 45degree offset bayer pattern
+				// Do not use those values as active area bounds:
+
+				fw = w;
+				fh = h;
+				m_spec.attribute("raw:FilterLayout", 2); // Staggered layout A
+
+
+				//https://www.libraw.org/node/2474
+				// Might need to use the logic from here.
+				// Note this isnt the same thing as XTrans, This is Super CCD
+			}
+			//TODO: Maybe handle is_sraw(), is_nikon_sraw(), is_coolscan_nef() ?
+
+			std::cout << "w: " << w << std::endl;
+			std::cout << "h: " << h << std::endl;
+			std::cout << "disp w: " << fw << std::endl;
+			std::cout << "disp h: " << fh << std::endl;
+			std::cout << "pixel aspect: " << m_processor->imgdata.sizes.pixel_aspect << std::endl;
+			std::cout << "fuji_width: " << m_processor->is_fuji_rotated() << std::endl;
+
+            //switch(m_processor->imgdata.sizes.flip){
+            //    case 3: /*180 degrees*/ {
+            //        fx = w - fx;
+            //        fy = h - fy;
+            //        break;
+            //    }
+            //    case 5: /*90 degrees CCW*/ {
+            //        std::swap(w,h);
+            //        std::swap(fw,fh);
+            //        std::swap(fx,fy);
+            //        fy = h - fh - fy;
+            //        break;
+            //    }
+            //    case 6: /*90 degrees CW*/ {
+            //        std::swap(w,h);
+            //        std::swap(fw,fh);
+            //        std::swap(fx,fy);
+            //        fx = w - fw - fx;
+            //        break;
+            //    }
+            //    case 0: /* no rotation */
+            //    default: break;
+            //}
 
             m_spec.width = w;
             m_spec.height = h;
@@ -1458,12 +1481,32 @@ RawInput::get_colorinfo()
         add("raw", "CalibrationIlluminant1", color.dng_color[0].illuminant);
         add("raw", "CalibrationIlluminant2", color.dng_color[1].illuminant);
 
-        add("raw", "DNGBlack", color.dng_levels.dng_black, false, 0);
-        add("raw", "DNGWhiteLevel",
+        // Libraw stuffs a bunch of information into a chunk of mememory called "cblack"
+        // and "fcblack" which are uint32 / float respectively
+        // It seems the black level dimensions are always stored at offset 4/5
+        // and the blacklevel readings are at offset 6+
+        // There should be dimx * dimy * nsamples (1 for bayer Y) black samples
+        const size_t cblack_dims_start_idx = 4;
+        const size_t fcblack_blacklevel_start_idx = 6;
+        // LibRaw/src/metadata/tiff.cpp:960  case 0xc619
+        add("raw", "BlackLevelDims",
+            cspan<unsigned int>(&(color.dng_levels.dng_cblack[cblack_dims_start_idx]),
+                                &(color.dng_levels.dng_cblack[fcblack_blacklevel_start_idx])),
+            false, 0u);
+
+        // LibRaw/src/metadata/tiff.cpp:1120  case 0xc61a
+        size_t n_black_samples = color.dng_levels.dng_cblack[cblack_dims_start_idx] *
+                                 color.dng_levels.dng_cblack[cblack_dims_start_idx + 1];
+        add("raw", "BlackLevel",
+            cspan<float>(&(color.dng_levels.dng_fcblack[fcblack_blacklevel_start_idx]),
+                         &(color.dng_levels.dng_fcblack[fcblack_blacklevel_start_idx + n_black_samples])),
+            false, 0.f);
+
+        add("raw", "WhiteLevel",
             cspan<unsigned int>(&(color.dng_levels.dng_whitelevel[0]),
                                 &(color.dng_levels.dng_whitelevel[3])),
             false, 0u);
-        add("raw", "DNGAnalogBalance",
+        add("raw", "AnalogBalance",
             cspan<float>(&(color.dng_levels.analogbalance[0]),
                          &(color.dng_levels.analogbalance[3])),
             false, 1.f);
@@ -1471,17 +1514,30 @@ RawInput::get_colorinfo()
             cspan<float>(&(color.dng_levels.asshotneutral[0]),
                          &(color.dng_levels.asshotneutral[3])),
             false, 1.f);
+    } else {
+        /*
+        uint32_t blackleveldims[2] = {1,1};
+        add("raw", "BlackLevelDims",
+            cspan<unsigned int>(&(color.dng_levels.dng_cblack[cblack_dims_start_idx]),
+                                &(color.dng_levels.dng_cblack[fcblack_blacklevel_start_idx])),
+            false, 0u);
+        add("raw", "BlackLevel", float(color.black));
+        */
     }
 
-    if (!m_spec.find_attribute("raw:asShotNeutral")){
+    if (!m_spec.find_attribute("raw:asShotNeutral", TypeDesc::FLOAT)){
         // Store the camera white balance settings in a more useful way
         float asShotNeutral[3] = {1.0, 1.0, 1.0};
         float norm = std::min({color.cam_mul[0], color.cam_mul[1], color.cam_mul[2]});
         for (size_t i=0; i<3; ++i){
             asShotNeutral[i] = norm / color.cam_mul[i];
         }
-        m_spec.attribute("raw:asShotNeutral", TypeColor, &asShotNeutral);
+        add("raw", "asShotNeutral",
+            cspan<float>(&(asShotNeutral[0]),
+                         &(asShotNeutral[3])),
+            true, 1.f);
     }
+
 }
 
 
@@ -1564,39 +1620,47 @@ RawInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     if (!m_process) {
         // The user has selected not to apply any debayering.
 
+        void* raw_image = m_processor->imgdata.rawdata.raw_image;
+        if (!raw_image){
+            std::cout << "Unsuppored debayer type!" << std::endl;
+        }
+        //TODO: why does oiio-images/raw/RAW_CANON_EOS_7D.CR2 not read?
+
+
+
         auto& sizes        = m_processor->imgdata.sizes;
-        int scanline_start = sizes.raw_width * y;
+        size_t scanline_start = sizes.raw_width * y;
 
         // The raw_image will not have been rotated, so we must factor that into our
         // array access
         // For none or 180 degree rotation, the scanlines are still contiguous in memory
-        if (sizes.flip == 0 /*no rotation*/ || sizes.flip == 3 /*180 degrees*/) {
-            if (sizes.flip == 3) {
-                scanline_start = sizes.raw_width * (m_spec.height - y);
-            }
+        //if (sizes.flip == 0 /*no rotation*/ || sizes.flip == 3 /*180 degrees*/) {
+        //    if (sizes.flip == 3) {
+        //        scanline_start = sizes.raw_width * (m_spec.height - y);
+        //    }
             unsigned short* scanline = &((m_processor->imgdata.rawdata.raw_image)[scanline_start]);
             convert_pixel_values(TypeDesc::UINT16, scanline, m_spec.format,
                                  data, m_spec.width);
-        }
+        //}
         // For 90 degrees ClockWise or CounterClockWise, our desired scanlines now run perpendicular
         // to the array direction so we must copy the pixels into a temporary contiguous buffer
-        else if (sizes.flip == 5 /*90 degrees CCW*/
-                 || sizes.flip == 6 /*90 degrees CW*/) {
-            scanline_start = m_spec.height - y;
-            if (sizes.flip == 6) {
-                scanline_start = y;
-            }
-            auto buffer = std::make_unique<uint16_t[]>(m_spec.width);
-            for (size_t i = 0; i < static_cast<size_t>(m_spec.width); ++i) {
-                size_t index
-                    = (sizes.flip == 5)
-                          ? i
-                          : m_spec.width - i;  //flip the index if rotating 90 degrees CW
-                buffer[index] = (m_processor->imgdata.rawdata.raw_image)[sizes.raw_width * i + scanline_start];
-            }
-            convert_pixel_values(TypeDesc::UINT16, buffer.get(), m_spec.format,
-                                 data, m_spec.width);
-        }
+        //else if (sizes.flip == 5 /*90 degrees CCW*/
+        //         || sizes.flip == 6 /*90 degrees CW*/) {
+        //    scanline_start = m_spec.height - y;
+        //    if (sizes.flip == 6) {
+        //        scanline_start = y;
+        //    }
+        //    auto buffer = std::make_unique<uint16_t[]>(m_spec.width);
+        //    for (size_t i = 0; i < static_cast<size_t>(m_spec.width); ++i) {
+        //        size_t index
+        //            = (sizes.flip == 5)
+        //                  ? i
+        //                  : m_spec.width - i;  //flip the index if rotating 90 degrees CW
+        //        buffer[index] = (m_processor->imgdata.rawdata.raw_image)[sizes.raw_width * i + scanline_start];
+        //    }
+        //    convert_pixel_values(TypeDesc::UINT16, buffer.get(), m_spec.format,
+        //                         data, m_spec.width);
+        //}
         return true;
     }
 
